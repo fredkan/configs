@@ -1,0 +1,202 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-secret
+  namespace: mysql
+  labels:
+    app: mysql
+type: Opaque
+data:
+  password: MTIzNDU2 # echo -n "123456" | base64
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: mysql
+  labels:
+    app: mysql
+spec:
+  ports:
+  - name: mysql
+    port: 3306
+  selector:
+    app: mysql
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: mysql
+  labels:
+    app: mysql
+spec:
+  selector:
+    matchLabels:
+      app: mysql
+  serviceName: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      initContainers:
+      - name: init-mysql
+        image: wenyangchou/centos:7-mysql
+        env:
+          - name: MYSQL_ROOT_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: mysql-secret
+                key: password
+        command:
+        - bash
+        - "-c"
+        - |
+          set -ex
+          # 从Pod的序号，生成server-id
+          [[ $(hostname) =~ -([0-9]+)$ ]] || exit 1
+          ordinal=${BASH_REMATCH[1]}
+          echo [mysqld] > /mnt/conf.d/server-id.cnf
+          # 由于server-id不能为0，因此给ID加100来避开它
+          echo server-id=$((100 + $ordinal)) >> /mnt/conf.d/server-id.cnf
+          # 如果Pod的序号为0，说明它是Master节点，从ConfigMap里把Master的配置文件拷贝到/mnt/conf.d目录下
+          # 否则，拷贝ConfigMap里的Slave的配置文件
+          if [[ ${ordinal} -eq 0 ]]; then
+            cp /mnt/config-map/master-01.cnf /mnt/conf.d
+          elif [[ ${ordinal} -eq 1 ]]; then
+            cp /mnt/config-map/master-02.cnf /mnt/conf.d
+          else
+            cp /mnt/config-map/slave.cnf /mnt/conf.d
+          fi
+        volumeMounts:
+        - name: conf
+          mountPath: /mnt/conf.d
+        - name: config-map
+          mountPath: /mnt/config-map
+
+      containers:
+      - name: mysql
+        image: wenyangchou/mysql:5.7
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secret
+              key: password
+        ports:
+        - name: mysql
+          containerPort: 3306
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/mysql
+          subPath: mysql
+        - name: conf
+          mountPath: /etc/mysql/conf.d
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+        livenessProbe:
+          exec:
+            command: ["mysqladmin", "ping", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+        readinessProbe:
+          exec:
+            command: ["mysqladmin", "ping", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
+          initialDelaySeconds: 5
+          periodSeconds: 2
+          timeoutSeconds: 1
+      - name: sync
+        image: wenyangchou/centos:7-mysql
+        env:
+          - name: MYSQL_ROOT_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: mysql-secret
+                key: password
+#        command: [ "sh", "-c" ]
+#        args: [ "while true; do sleep 3600; done" ]
+        command:
+          - bash
+          - "-c"
+          - |
+            set -ex
+            [[ $(hostname) =~ -([0-9]+)$ ]] || exit 1
+            ordinal=${BASH_REMATCH[1]}
+
+            if [[ $ordinal -eq 0 ]]; then
+              MASTER_HOST=mysql-1.mysql.mysql
+            else
+              MASTER_HOST=mysql-0.mysql.mysql
+            fi
+
+            cd /var/lib/mysql
+            echo "Waiting for mysqld to be ready（accepting connections）"
+            until mysql -uroot -p${MYSQL_ROOT_PASSWORD} -h127.0.0.1 -e "SELECT 1"; do sleep 1; done
+            until mysql -uroot -p${MYSQL_ROOT_PASSWORD} -h${MASTER_HOST} -e "SELECT 1"; do sleep 1; done
+            
+            result=$(mysql -uroot -p${MYSQL_ROOT_PASSWORD} -h127.0.0.1 -e "SHOW SLAVE STATUS\G")
+            if [[ $result == *"Slave_IO_Running: Yes"* && $result == *"Slave_SQL_Running: Yes"* ]]; then
+              echo "recover START SLAVE "
+            else
+              mysql -uroot -p${MYSQL_ROOT_PASSWORD} -h127.0.0.1 -e "CHANGE MASTER TO MASTER_HOST='${MASTER_HOST}',MASTER_USER='root',MASTER_PASSWORD='${MYSQL_ROOT_PASSWORD}',MASTER_CONNECT_RETRY=10;START SLAVE;"
+            fi
+            # 这个是为了hold这个容器的进程，如果不hold住的话，pod会重启
+            # 当然这里可以使用更优雅的方式，比如TTL等，这里不做探讨
+            while true; do sleep 3600; done
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/mysql
+          subPath: mysql
+        - name: conf
+          mountPath: /etc/mysql/conf.d
+      volumes:
+      - name: conf
+[O        emptyDir: {}
+      - name: config-map
+        configMap:
+          name: mysql
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes:
+      - "ReadWriteOnce"
+      storageClassName: mysql-local-storage
+      resources:
+        requests:
+          storage: 3Gi
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql
+  namespace: mysql
+  labels:
+    app: mysql
+data:
+  master-01.cnf: |
+    # Master配置
+    [mysqld]
+    log-bin=mysqllog
+    skip-name-resolve
+    replicate-ignore-db=mysql
+    replicate-ignore-db = information_schema
+    replicate-ignore-db = performance_schema
+    replicate-ignore-db = sys
+    auto_increment_increment=2
+    auto_increment_offset=1
+  master-02.cnf: |
+    # Master配置
+    [mysqld]
+    log-bin=mysqllog
+    skip-name-resolve
+    replicate-ignore-db=mysql
+    replicate-ignore-db = information_schema
+    replicate-ignore-db = performance_schema
+    replicate-ignore-db = sys
+    auto_increment_increment=2
+    auto_increment_offset=2
